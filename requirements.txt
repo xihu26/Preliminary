@@ -1,3 +1,7 @@
 Flask
 gunicorn
 google-genai
+<<<<<<< HEAD
+=======
+python-dotenv
+>>>>>>> 55a5192 (Connect nutrition bot to LINE)
