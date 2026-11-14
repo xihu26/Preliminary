@@ -10,6 +10,9 @@ from testing import analysis
 
 app = Flask(__name__)
 
+# Temporary per-user goal storage. This resets if Render restarts the app.
+user_goals = {}
+
 
 @app.post("/callback")
 def callback():
@@ -32,41 +35,67 @@ def callback():
 
         message = event.get("message", {})
         message_type = message.get("type")
+        user_id = event.get("source", {}).get("userId")
 
         try:
-            if message_type == "text":
-                text = message["text"]
-                food, separator, goal = text.partition("|")
+            if not user_id:
+                reply = "Please message me in a one-to-one chat."
 
-                if not separator or not food.strip() or not goal.strip():
-                    reply = "Send food and goal like: oatmeal | fat loss"
+            elif message_type == "text":
+                text = message.get("text", "").strip()
+
+                if text.lower().startswith("goal:"):
+                    goal = text.partition(":")[2].strip()
+
+                    if goal:
+                        user_goals[user_id] = goal
+                        reply = f"Got it. Your goal is {goal}. Now send your food photo."
+                    else:
+                        reply = "Send your goal like this: goal: fat loss"
+
                 else:
-                    reply = analysis(food.strip(), goal.strip())
+                    food, separator, goal = text.partition("|")
+
+                    if separator and food.strip() and goal.strip():
+                        user_goals[user_id] = goal.strip()
+                        reply = analysis(food.strip(), goal.strip())
+
+                    elif user_id in user_goals:
+                        reply = analysis(text, user_goals[user_id])
+
+                    else:
+                        reply = "First send your goal, like: goal: fat loss"
 
             elif message_type == "image":
-                image_response = requests.get(
-                    f"https://api-data.line.me/v2/bot/message/{message['id']}/content",
-                    headers={
-                        "Authorization":
-                            f"Bearer {os.environ['CHANNEL_ACCESS_TOKEN']}"
-                    },
-                    timeout=30,
-                )
-                image_response.raise_for_status()
+                goal = user_goals.get(user_id)
 
-                mime_type = image_response.headers.get(
-                    "Content-Type", "image/jpeg"
-                ).split(";")[0]
+                if not goal:
+                    reply = "First send your goal, like: goal: fat loss. Then send your photo."
+                else:
+                    image_response = requests.get(
+                        f"https://api-data.line.me/v2/bot/message/{message['id']}/content",
+                        headers={
+                            "Authorization": (
+                                f"Bearer {os.environ['CHANNEL_ACCESS_TOKEN']}"
+                            )
+                        },
+                        timeout=30,
+                    )
+                    image_response.raise_for_status()
 
-                reply = analysis(
-                    food="",
-                    goal="",
-                    image_bytes=image_response.content,
-                    mime_type=mime_type,
-                )
+                    mime_type = image_response.headers.get(
+                        "Content-Type", "image/jpeg"
+                    ).split(";")[0]
+
+                    reply = analysis(
+                        food="",
+                        goal=goal,
+                        image_bytes=image_response.content,
+                        mime_type=mime_type,
+                    )
 
             else:
-                reply = "Please send a food description or a food photo."
+                reply = "Please send a goal, food description, or food photo."
 
             if not reply:
                 reply = "I couldn't analyse that. Please try again."
@@ -78,8 +107,9 @@ def callback():
         reply_response = requests.post(
             "https://api.line.me/v2/bot/message/reply",
             headers={
-                "Authorization":
-                    f"Bearer {os.environ['CHANNEL_ACCESS_TOKEN']}",
+                "Authorization": (
+                    f"Bearer {os.environ['CHANNEL_ACCESS_TOKEN']}"
+                ),
                 "Content-Type": "application/json",
             },
             json={
