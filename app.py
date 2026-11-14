@@ -29,7 +29,11 @@ def callback():
 
     for event in events:
         if event.get("type") == "follow":
-            welcome = ("Hi! I’m your nutrition assistant.\nSend goal: [your nutrition goal], then send a food photo or description of your meal.\nI’ll estimate its nutrition and suggest improvements.")
+            welcome = ("🥗 Hello! I’m your personal nutrition assistant.\n\n"
+    "✨ First, tell me your goal using this format:\n"
+    "🎯 Goal = [your nutrition goal]\n\n"
+    "📸 Next, send a photo of your meal or describe what you're eating.\n\n"
+    "💪 I’ll approximate the nutrition and share tips to help you stay on track!")
 
             response = requests.post(
                 "https://api.line.me/v2/bot/message/reply",
