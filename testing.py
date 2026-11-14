@@ -39,18 +39,27 @@ def main():
     goal = input("goal: ")
     print(analysis(food, goal))
 
-def analysis(food, goal):
-    print("Calling Gemini...")
+def analysis(food="", goal="", image_bytes=None, mime_type="image/jpeg"):
+    prompt = (
+        f"{SYSTEM_PROMPT}\n\n"
+        f"Food Description: {food or 'Identify the food from the attached image.'}\n"
+        f"Nutrition Goal: {goal}"
+    )
+
+    contents = [prompt]
+
+    if image_bytes:
+        contents.append(
+            types.Part.from_bytes(data=image_bytes, mime_type=mime_type)
+        )
+
     try:
         response = client.models.generate_content(
-                model="gemini-3.1-flash-lite", contents=f"{SYSTEM_PROMPT}\n\nFood Description: {food}\nNutrition Goal: {goal}",
-                config=types.GenerateContentConfig(temperature=0.4))
-        
-        return response.text.strip()
-
-    except TimeoutError:
-        print("Request timed out. Please try again.")
-        return None
+            model="gemini-3.1-flash-lite",
+            contents=contents,
+            config=types.GenerateContentConfig(temperature=0.4),
+        )
+        return response.text.strip() if response.text else "I couldn't identify the food."
     except Exception as e:
         return f"Error ({type(e).__name__}): {e}"
     
