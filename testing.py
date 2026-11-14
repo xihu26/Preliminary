@@ -25,12 +25,12 @@ Suggested Substitutions
 - Current → Alternative | Benefit
 - Current → Alternative | Benefit
 Estimated Nutrition Improvements
-- Calories:
-- Protein:
-- Carbs:
-- Fat:
-- Fibre:
-- Sodium:
+- Calories: Current → New 
+- Protein: Current → New 
+- Carbs: Current → New 
+- Fat: Current → New 
+- Fibre: Current → New 
+- Sodium: Current → New 
 Assumptions
 - ..."""
 

@@ -11,7 +11,7 @@ GMAIL_ADDRESS = "lunababoody@gmail.com"       # Gmail account sending emails fro
 GMAIL_APP_PASSWORD = "wrdv dmpw iacf gohf"    # Gmail App Passwords
 TEST_MODE = True                              # True = send everything to me
 TEST_RECIPIENT = "lunacarly7@gmail.com"  
-client = genai.Client(api_key="AQ.Ab8RN6LZvgIFJIxeI3RJrgCN1-B82f9Fhl27hmGEnqtnavjwTg")
+client = genai.Client(api_key="insert")
 def main():
 
     # Fetch the CSV data from the Google Sheets URL
