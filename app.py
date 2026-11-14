@@ -10,7 +10,7 @@ from testing import analysis
 
 app = Flask(__name__)
 
-# Temporary per-user goal storage. This resets if Render restarts the app.
+# temporary goal storage that resets if Render restarts
 user_goals = {}
 
 
@@ -20,9 +20,7 @@ def callback():
     signature = request.headers.get("X-Line-Signature", "")
     secret = os.environ["CHANNEL_SECRET"]
 
-    expected = base64.b64encode(
-        hmac.new(secret.encode(), body, hashlib.sha256).digest()
-    ).decode()
+    expected = base64.b64encode(hmac.new(secret.encode(), body, hashlib.sha256).digest()).decode()
 
     if not hmac.compare_digest(signature, expected):
         return "Invalid signature", 401
@@ -30,6 +28,22 @@ def callback():
     events = json.loads(body).get("events", [])
 
     for event in events:
+        if event.get("type") == "follow":
+            welcome = ("Hi! I’m your nutrition assistant. Send "
+                "`goal: [your nutrition goal]`, then send a food photo or description of your meal. "
+                "And I’ll estimate its nutrition and suggest improvements.")
+
+            response = requests.post(
+                "https://api.line.me/v2/bot/message/reply",
+                headers={"Authorization": f"Bearer {os.environ['CHANNEL_ACCESS_TOKEN']}",
+                         "Content-Type": "application/json",},
+                json={"replyToken": event["replyToken"],
+                    "messages": [{"type": "text", "text": welcome}],},
+                timeout=15,
+            )
+            response.raise_for_status()
+            continue
+
         if event.get("type") != "message":
             continue
 
@@ -49,9 +63,9 @@ def callback():
 
                     if goal:
                         user_goals[user_id] = goal
-                        reply = f"Got it. Your goal is {goal}. Now send your food photo."
+                        reply = f"Understood. Your goal is {goal}. Now please send your food photo."
                     else:
-                        reply = "Send your goal like this: goal: fat loss"
+                        reply = "Send your goal in this format: goal= fat loss"
 
                 else:
                     food, separator, goal = text.partition("|")
@@ -64,13 +78,13 @@ def callback():
                         reply = analysis(text, user_goals[user_id])
 
                     else:
-                        reply = "First send your goal, like: goal: fat loss"
+                        reply = "First send your goal in the format: goal= fat loss"
 
             elif message_type == "image":
                 goal = user_goals.get(user_id)
 
                 if not goal:
-                    reply = "First send your goal, like: goal: fat loss. Then send your photo."
+                    reply = "First send your goal, in the format: goal= fat loss. Then send your photo."
                 else:
                     image_response = requests.get(
                         f"https://api-data.line.me/v2/bot/message/{message['id']}/content",
@@ -95,7 +109,7 @@ def callback():
                     )
 
             else:
-                reply = "Please send a goal, food description, or food photo."
+                reply = "Please send a goal, food description, or valid food photo."
 
             if not reply:
                 reply = "I couldn't analyse that. Please try again."
