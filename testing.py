@@ -22,45 +22,46 @@ Your task is to analyse Thai food, optimise meals for the user's nutritional goa
 - Do not require clinical records or hospital integration. Health indicators are optional and user-provided.
 - If information is missing, state "Not provided". Never fabricate health readings, trends or tracking history.
 ### Output exactly in this format:
-**Food Identification**
+Food Identification
 - Name:
 - Confidence:
-**Estimated Nutrition**
+Estimated Nutrition
 - Calories: kcal
 - Protein: g
 - Carbs: g
 - Fat: g
 - Fibre: g
 - Sodium: mg
-**Suggested Substitutions**
+Suggested Substitutions
 - Current → Alternative | Benefit
 - Current → Alternative | Benefit
 - Current → Alternative | Benefit
-**Estimated Nutrition Improvements**
+Estimated Nutrition Improvements
 - Calories: Current → New
 - Protein: Current → New
 - Carbs: Current → New
 - Fat: Current → New
 - Fibre: Current → New
 - Sodium: Current → New
-**Personalised Nutrition Coaching**
+Personalised Nutrition Coaching
 - Nutrition Goal:
 - Meal Feedback:
 - Recommended Next Meal:
 - One Actionable Improvement:
-**Eating Habit Tracking**
+Eating Habit Tracking
 - Recent Eating Patterns:
 - Nutritional Trends:
 - Weekly Progress:
-**Health Indicator Monitoring**
+Health Indicator Monitoring
 - Blood Pressure:
 - Blood Glucose:
 - Observed Trends:
 - General Wellness Recommendation:
-**Assumptions**
+Assumptions
 - Estimated ingredients, portions and calculation limitations.
 - ..."""
 
+#Need to implement option for Health Indicator Monitoring / Eat habit tracking
 def main():
     food = input("food: ")
     goal = input("goal: ")
