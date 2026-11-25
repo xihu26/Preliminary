@@ -1,0 +1,498 @@
+diff --git a/app/db.py b/app/db.py
+index ccc2ccf..beea8b3 100644
+--- a/app/db.py
++++ b/app/db.py
+@@ -341,6 +341,23 @@ def _migration_v12_photo_credit(conn: sqlite3.Connection) -> None:
+     conn.execute("ALTER TABLE meal_photo ADD COLUMN credit TEXT")
+ 
+ 
++def _migration_v13_line_sync(conn: sqlite3.Connection) -> None:
++    conn.executescript(
++        """
++        CREATE TABLE IF NOT EXISTS line_web_link (
++            token TEXT PRIMARY KEY, user_id TEXT NOT NULL, expires INTEGER NOT NULL
++        );
++        CREATE TABLE IF NOT EXISTS line_web_session (
++            token TEXT PRIMARY KEY, user_id TEXT NOT NULL, expires INTEGER NOT NULL
++        );
++        CREATE TABLE IF NOT EXISTS line_meal_draft (
++            user_id TEXT NOT NULL, message_id TEXT NOT NULL, payload TEXT, expires INTEGER NOT NULL,
++            PRIMARY KEY (user_id, message_id)
++        );
++        """
++    )
++
++
+ MIGRATIONS = [
+     ("v1_foundation", _migration_v1_foundation),
+     ("v2_food_log", _migration_v2_food_log),
+@@ -354,6 +371,7 @@ MIGRATIONS = [
+     ("v10_premium_game", _migration_v10_premium_game),
+     ("v11_allergies_photos", _migration_v11_allergies_photos),
+     ("v12_photo_credit", _migration_v12_photo_credit),
++    ("v13_line_sync", _migration_v13_line_sync),
+ ]
+ 
+ 
+@@ -562,6 +580,9 @@ def delete_all_user_data(user_id: str) -> None:
+         conn.execute("DELETE FROM user_profile WHERE user_id = ?", (user_id,))
+         conn.execute("DELETE FROM food_log WHERE user_id = ?", (user_id,))
+         conn.execute("DELETE FROM pending_scan WHERE user_id = ?", (user_id,))
++        conn.execute("DELETE FROM line_web_link WHERE user_id = ?", (user_id,))
++        conn.execute("DELETE FROM line_web_session WHERE user_id = ?", (user_id,))
++        conn.execute("DELETE FROM line_meal_draft WHERE user_id = ?", (user_id,))
+         conn.execute("DELETE FROM user_state WHERE user_id = ?", (user_id,))
+         conn.execute("DELETE FROM contact_link WHERE user_id = ? OR contact_user_id = ?",
+                      (user_id, user_id))
+diff --git a/app/main.py b/app/main.py
+index 9056969..dc2532f 100644
+--- a/app/main.py
++++ b/app/main.py
+@@ -33,6 +33,7 @@ from linebot.v3.webhooks.models import (
+ from app import db, line_client, registry, scheduler
+ from app.config import settings
+ from app.web.api import router as web_router
++from app.web.line_sync import router as line_sync_router
+ from app.web.exercise import router as exercise_router
+ from app.web.plan import router as plan_router
+ from app.web.circle import router as circle_router
+@@ -226,6 +227,7 @@ async def lifespan(app: FastAPI):
+ 
+ app = FastAPI(title="Gindee", lifespan=lifespan)
+ app.include_router(web_router)
++app.include_router(line_sync_router)
+ app.include_router(exercise_router)
+ app.include_router(plan_router)
+ app.include_router(circle_router)
+diff --git a/app/web/api.py b/app/web/api.py
+index a948779..3edbbd9 100644
+--- a/app/web/api.py
++++ b/app/web/api.py
+@@ -1,10 +1,9 @@
+ """Gindee web API: JSON endpoints for the browser app.
+ 
+ Shares the database, nutrition table, LLM helpers and safety rules with the
+-LINE bot. Web users are identified by a client-generated id sent in the
+-``X-Gindee-User`` header and stored as ``web:<id>``. This is device-level
+-identity for a prototype, not authentication: put real auth in front of it
+-before exposing personal health data on the public internet.
++LINE bot. A verified LINE session uses the same user ID as the bot.
++Guests use a separate device ID from the ``X-Gindee-User`` header
++under the ``web:`` namespace.
+ """
+ 
+ import json
+@@ -14,7 +13,7 @@ from datetime import date, datetime, timedelta, timezone
+ from typing import Literal, Optional
+ from zoneinfo import ZoneInfo
+ 
+-from fastapi import APIRouter, Depends, File, Header, HTTPException, Query, UploadFile
++from fastapi import APIRouter, Cookie, Depends, File, Header, HTTPException, Query, UploadFile
+ from pydantic import BaseModel, Field, field_validator
+ from rapidfuzz import fuzz, process
+ 
+@@ -47,7 +46,15 @@ _TIME_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
+ # ---------------------------------------------------------------------------
+ 
+ 
+-def current_user(x_gindee_user: str = Header(default="")) -> str:
++def current_user(x_gindee_user: str = Header(default=""),
++                 gindee_line_session: Optional[str] = Cookie(default=None)) -> str:
++    if gindee_line_session:
++        from app.web.line_sync import session_user
++
++        user_id = session_user(gindee_line_session)
++        if user_id:
++            return user_id
++        raise HTTPException(401, "line_session_expired")
+     if not _USER_RE.match(x_gindee_user or ""):
+         raise HTTPException(401, "missing_or_invalid_user")
+     return WEB_USER_PREFIX + x_gindee_user
+@@ -230,6 +237,7 @@ def _targets_payload(profile: Optional[dict], prefs: Optional[dict] = None) -> d
+ def _me_payload(user_id: str) -> dict:
+     profile = food_log._get_profile(user_id)
+     return {
++        "line_connected": not user_id.startswith(WEB_USER_PREFIX),
+         "onboarded": profile is not None,
+         "profile": profile and {k: profile[k] for k in (
+             "sex", "age", "height_cm", "weight_kg", "activity_level",
+@@ -510,26 +518,31 @@ def _guess_slot(hour: int) -> str:
+ @router.post("/log")
+ def add_log(body: LogIn, user_id: str = Depends(current_user)) -> dict:
+     target = _target(user_id)
++    with db.db() as conn:
++        ids = _insert_meal(conn, body, user_id, target)
++    return {"ids": ids}
++
++
++def _insert_meal(conn, body: LogIn, user_id: str, target: float) -> list[int]:
+     when = body.eaten_at or _now()
+     if when.tzinfo is None:
+         when = when.replace(tzinfo=timezone.utc)
+     if when > _now() + timedelta(minutes=5):
+         raise HTTPException(422, "eaten_at_in_future")
+     ids = []
+-    with db.db() as conn:
+-        for it in body.items:
+-            score = scoring.meal_score(it.kcal, it.protein_g, it.carbs_g, it.fat_g, target)
+-            cur = conn.execute(
+-                """INSERT INTO food_log (user_id, eaten_at, dish_name, name_th,
+-                       estimated_grams, kcal, protein_g, carbs_g, fat_g, source,
+-                       meal_slot, score, created_at)
+-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+-                (user_id, _iso(when), it.name_en.strip(), (it.name_th or "").strip() or None,
+-                 it.grams, round(it.kcal, 1), round(it.protein_g, 1), round(it.carbs_g, 1),
+-                 round(it.fat_g, 1), it.source, body.slot, score, _iso(_now())),
+-            )
+-            ids.append(cur.lastrowid)
+-    return {"ids": ids}
++    for it in body.items:
++        score = scoring.meal_score(it.kcal, it.protein_g, it.carbs_g, it.fat_g, target)
++        cur = conn.execute(
++            """INSERT INTO food_log (user_id, eaten_at, dish_name, name_th,
++                   estimated_grams, kcal, protein_g, carbs_g, fat_g, source,
++                   meal_slot, score, created_at)
++               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
++            (user_id, _iso(when), it.name_en.strip(), (it.name_th or "").strip() or None,
++             it.grams, round(it.kcal, 1), round(it.protein_g, 1), round(it.carbs_g, 1),
++             round(it.fat_g, 1), it.source, body.slot, score, _iso(_now())),
++        )
++        ids.append(cur.lastrowid)
++    return ids
+ 
+ 
+ @router.delete("/log/{entry_id}")
+diff --git a/app/web/line_sync.py b/app/web/line_sync.py
+new file mode 100644
+index 0000000..573cc3b
+--- /dev/null
++++ b/app/web/line_sync.py
+@@ -0,0 +1,160 @@
++"""Connect the signed LINE webhook to GinDee's diary and browser sessions."""
++
++import hashlib
++import hmac
++import os
++import secrets
++import time
++from typing import Optional
++from zoneinfo import ZoneInfo
++
++from fastapi import APIRouter, Cookie, Depends, File, Header, HTTPException, Response, UploadFile
++from pydantic import BaseModel, Field, ValidationError
++
++from app import db
++from app.web import api
++
++router = APIRouter(prefix="/api")
++COOKIE = "gindee_line_session"
++LINK_TTL = 300
++SESSION_TTL = 30 * 86400
++DRAFT_TTL = 86400
++
++
++def _digest(token: str) -> str:
++    return hashlib.sha256(token.encode()).hexdigest()
++
++
++def session_user(token: Optional[str]) -> Optional[str]:
++    if not token:
++        return None
++    with db.db() as conn:
++        row = conn.execute(
++            "SELECT user_id FROM line_web_session WHERE token = ? AND expires > ?",
++            (_digest(token), int(time.time())),
++        ).fetchone()
++    return row["user_id"] if row else None
++
++
++def _bot_user(authorization: str = Header(default=""),
++              x_line_user: str = Header(pattern=r"^U[0-9a-fA-F]{32}$")) -> str:
++    secret = os.environ.get("GINDEE_SYNC_SECRET", "")
++    if not secret or not hmac.compare_digest(
++        authorization.encode(), ("Bearer " + secret).encode()
++    ):
++        raise HTTPException(401, "invalid_bot_credentials")
++    return x_line_user
++
++
++@router.post("/line/link")
++def issue_link(user_id: str = Depends(_bot_user)) -> dict:
++    token = secrets.token_urlsafe(32)
++    now = int(time.time())
++    with db.db() as conn:
++        conn.execute("DELETE FROM line_web_link WHERE expires <= ? OR user_id = ?", (now, user_id))
++        conn.execute("INSERT INTO line_web_link VALUES (?, ?, ?)", (_digest(token), user_id, now + LINK_TTL))
++    return {"token": token}
++
++
++class LinkIn(BaseModel):
++    token: str = Field(min_length=43, max_length=43)
++
++
++@router.post("/line/session")
++def sign_in(body: LinkIn, response: Response) -> dict:
++    now = int(time.time())
++    session = secrets.token_urlsafe(32)
++    with db.db() as conn:
++        row = conn.execute(
++            "DELETE FROM line_web_link WHERE token = ? AND expires > ? RETURNING user_id",
++            (_digest(body.token), now),
++        ).fetchone()
++        if not row:
++            raise HTTPException(410, "link_expired")
++        conn.execute("DELETE FROM line_web_session WHERE expires <= ?", (now,))
++        conn.execute("INSERT INTO line_web_session VALUES (?, ?, ?)",
++                     (_digest(session), row["user_id"], now + SESSION_TTL))
++    response.set_cookie(COOKIE, session, max_age=SESSION_TTL, secure=True, httponly=True,
++                        samesite="lax", path="/api")
++    return {"ok": True}
++
++
++@router.delete("/line/session")
++def sign_out(response: Response, gindee_line_session: Optional[str] = Cookie(default=None)) -> dict:
++    if gindee_line_session:
++        with db.db() as conn:
++            conn.execute("DELETE FROM line_web_session WHERE token = ?", (_digest(gindee_line_session),))
++    response.delete_cookie(COOKIE, path="/api", secure=True, httponly=True, samesite="lax")
++    return {"ok": True}
++
++
++def _prepare(user_id: str, message_id: str, estimate: dict) -> dict:
++    if not estimate["is_food"]:
++        return estimate
++    now = api._now()
++    slot = api._guess_slot(now.astimezone(ZoneInfo(api._tz_name(user_id))).hour)
++    try:
++        meal = api.LogIn(slot=slot, items=estimate["items"], eaten_at=now)
++    except ValidationError as exc:
++        raise HTTPException(502, "invalid_meal_estimate") from exc
++    with db.db() as conn:
++        conn.execute(
++            """INSERT INTO line_meal_draft (user_id, message_id, payload, expires)
++               VALUES (?, ?, ?, ?) ON CONFLICT (user_id, message_id) DO NOTHING""",
++            (user_id, message_id, meal.model_dump_json(), int(now.timestamp()) + DRAFT_TTL),
++        )
++        row = conn.execute(
++            "SELECT payload, expires FROM line_meal_draft WHERE user_id = ? AND message_id = ?",
++            (user_id, message_id),
++        ).fetchone()
++    if row["payload"] is None:
++        return {"already_logged": True}
++    if row["expires"] <= int(now.timestamp()):
++        raise HTTPException(410, "draft_expired")
++    return {"is_food": True, "items": api.LogIn.model_validate_json(row["payload"]).model_dump()["items"]}
++
++
++class DescribeIn(api.EstimateIn):
++    message_id: str = Field(pattern=r"^[0-9]{1,32}$")
++
++
++@router.post("/line/estimate")
++async def estimate_text(body: DescribeIn, user_id: str = Depends(_bot_user)) -> dict:
++    return _prepare(user_id, body.message_id, await api.estimate_text(body, user_id))
++
++
++@router.post("/line/scan/{message_id}")
++async def scan_photo(message_id: str, file: UploadFile = File(...),
++                     user_id: str = Depends(_bot_user)) -> dict:
++    if not message_id.isascii() or not message_id.isdigit() or len(message_id) > 32:
++        raise HTTPException(422, "invalid_message_id")
++    return _prepare(user_id, message_id, await api.scan_food(file, user_id))
++
++
++@router.post("/line/confirm/{message_id}")
++def confirm(message_id: str, user_id: str = Depends(_bot_user)) -> dict:
++    target = api._target(user_id)
++    with db.db() as conn:
++        conn.execute("BEGIN IMMEDIATE")
++        row = conn.execute(
++            "SELECT payload, expires FROM line_meal_draft WHERE user_id = ? AND message_id = ?",
++            (user_id, message_id),
++        ).fetchone()
++        if not row:
++            raise HTTPException(404, "draft_missing")
++        if row["payload"] is None:
++            return {"already_logged": True}
++        if row["expires"] <= int(time.time()):
++            raise HTTPException(410, "draft_expired")
++        ids = api._insert_meal(conn, api.LogIn.model_validate_json(row["payload"]), user_id, target)
++        conn.execute(
++            "UPDATE line_meal_draft SET payload = NULL WHERE user_id = ? AND message_id = ?",
++            (user_id, message_id),
++        )
++    return {"ids": ids}
++
++
++@router.get("/line/day")
++def today(user_id: str = Depends(_bot_user)) -> dict:
++    day = api.get_day(day=None, user_id=user_id)
++    return {key: day[key] for key in ("date", "entries", "totals")}
+diff --git a/app/web/static/app.js b/app/web/static/app.js
+index a4c4803..45d6820 100644
+--- a/app/web/static/app.js
++++ b/app/web/static/app.js
+@@ -44,6 +44,7 @@ function api(path, opts) {
+  * ------------------------------------------------------------------ */
+ var T = {
+   en: {
++    line_signout: 'Sign out of LINE', line_connect_hint: 'Send Connect GinDee to the LINE bot, then open its sign-in link.',
+     food_swaps: 'Food swaps', swap_sodium: 'Less sodium', swap_protein: 'More protein',
+     swap_fish: 'Ask for less fish sauce', swap_sauce: 'Ask for less sauce', swap_chicken: 'Ask for extra chicken', swap_custom: 'Add a protein you already eat',
+     swap_benefit_fish: 'Keep the Thai basil and chilli. Using less fish sauce can reduce sodium.',
+@@ -257,6 +258,7 @@ var T = {
+     of_target: 'of target'
+   },
+   th: {
++    line_signout: 'ออกจากระบบ LINE', line_connect_hint: 'ส่ง Connect GinDee ให้บอต LINE แล้วเปิดลิงก์เพื่อเข้าสู่ระบบ',
+     food_swaps: 'ปรับเมนู', swap_sodium: 'ลดโซเดียม', swap_protein: 'เพิ่มโปรตีน',
+     swap_fish: 'ขอใส่น้ำปลาน้อย', swap_sauce: 'ขอซอสน้อย', swap_chicken: 'ขอเพิ่มเนื้อไก่', swap_custom: 'เพิ่มแหล่งโปรตีนที่คุณกินได้',
+     swap_benefit_fish: 'ยังได้รสกะเพราและพริกเหมือนเดิม การลดน้ำปลาอาจช่วยลดโซเดียม',
+@@ -870,7 +872,7 @@ var LOADERS = {
+   exercise: function () { return Promise.all([loadExercise(), loadDay()]); },
+   settings: function () { return S.today ? null : loadDay(); },
+   circle: function () { return Promise.all([loadCircle(), S.today ? null : loadDay()]); },
+-  buddy: function () { return Promise.all([api('/game').then(function (r) { S.game = r; }), S.today ? null : loadDay()]); },
++  buddy: function () { return Promise.all([api('/game').then(function (r) { S.game = r; }), loadDay()]); },
+   premium: function () { return api('/premium').then(function (r) { S.premium = r; }); },
+   report: function () { return S.me.prefs.premium ? api('/report?days=' + (S.repDays || 7)).then(function (r) { S.report = r; }) : api('/premium').then(function (r) { S.premium = r; }); },
+   profile: function () { return null; }
+@@ -1769,6 +1771,10 @@ function vSettings() {
+   var conds = ['vegetarian', 'halal', 'no_pork', 'high_protein', 'low_sugar', 'low_sodium', 'diabetes_friendly', 'kidney_friendly'];
+   return '<div class="view">' + sectionHead(t('settings'), esc(pr.display_name || 'Gindee'), '') +
+     '<div class="wrap"><div class="grid">' +
++    '<div class="card c12 pad-lg"><h3>LINE</h3>' +
++    (me.line_connected
++      ? '<button class="btn sm ghost" data-act="line-signout">' + t('line_signout') + '</button>'
++      : '<p>' + t('line_connect_hint') + '</p>') + '</div>' +
+     '<div class="card c12 pad-lg"><div class="between wrapx"><div class="row">' + avatar(pr.display_name, 54, true) +
+     '<div><h3 style="font-size:20px">' + esc(pr.display_name || t('profile')) + (pr.nationality ? ' <span title="' + esc(countryName(pr.nationality)) + '">' + flag(pr.nationality) + '</span>' : '') + '</h3><div class="cap">' + (pr.nationality ? esc(countryName(pr.nationality)) + ' \u00b7 ' : '') + t('age_label') + ' ' + p.age + ' \u00b7 ' + Math.round(p.height_cm) + ' ' + t('cm') + ' \u00b7 ' + f1(p.weight_kg) + ' ' + t('kg') + ' \u00b7 ' + t(pr.goal) + '</div></div></div>' +
+     '<a class="btn sm ghost" href="#/profile">' + ic('edit', 13) + t('edit_profile') + '</a></div></div>' +
+@@ -2448,14 +2454,54 @@ document.addEventListener('keydown', function (e) {
+   }
+ });
+ 
+-window.addEventListener('hashchange', route);
++document.addEventListener('click', function (e) {
++  var button = e.target.closest('[data-act="line-signout"]');
++  if (!button) return;
++  button.disabled = true;
++  api('/line/session', { method: 'DELETE' }).then(function () {
++    location.replace(location.pathname);
++  }).catch(function (err) { button.disabled = false; toast(errMsg(err), true); });
++});
++window.addEventListener('hashchange', function () { if (S.me) route(); });
++document.addEventListener('visibilitychange', function () {
++  if (!document.hidden && S.me && S.me.line_connected && !S.modal &&
++      ['today', 'history', 'buddy'].indexOf(S.view) !== -1) route();
++});
+ 
+ /* ------------------------------------------------------------------ *
+  * Boot
+  * ------------------------------------------------------------------ */
+ applyTheme();
+ document.getElementById('view').innerHTML = skeleton();
+-loadMe().then(route).catch(function () {
+-  document.getElementById('view').innerHTML = '<div class="wrap">' + emptyState('info', t('err_net'), '<button class="btn sm" onclick="location.reload()">Retry</button>') + '</div>';
+-});
++var lineLink = location.hash.match(/^#line-link=([A-Za-z0-9_-]{43})$/);
++if (lineLink) {
++  history.replaceState(null, '', location.pathname + location.search);
++  var view = document.getElementById('view');
++  view.innerHTML = '<div class="wrap"><h2>Continue with LINE</h2>' +
++    '<p>Use a sign-in link you requested in your private chat with the GinDee bot.</p>' +
++    '<button class="btn" id="line-signin">Continue with LINE</button> ' +
++    '<a href="/">Cancel</a><p role="status" id="line-status"></p></div>';
++  document.getElementById('line-signin').addEventListener('click', function () {
++    var button = this;
++    button.disabled = true;
++    api('/line/session', { method: 'POST', body: { token: lineLink[1] } })
++      .then(function () { location.reload(); })
++      .catch(function (err) {
++        document.getElementById('line-status').textContent = err.status === 410
++          ? 'This link expired. Send Connect GinDee to the bot for a new link.'
++          : 'Sign-in failed. Please try again.';
++        button.disabled = err.status === 410;
++      });
++  });
++} else {
++  loadMe().then(route).catch(function (err) {
++    if (err.detail === 'line_session_expired') {
++      api('/line/session', { method: 'DELETE' }).then(function () { location.reload(); })
++        .catch(function (error) { toast(errMsg(error), true); });
++      return;
++    }
++    document.getElementById('view').innerHTML = '<div class="wrap">' +
++      emptyState('info', t('err_net'), '<button class="btn sm" onclick="location.reload()">Retry</button>') + '</div>';
++  });
++}
+ })();
+diff --git a/app/web/static/index.html b/app/web/static/index.html
+index 472fe3c..3b4158f 100644
+--- a/app/web/static/index.html
++++ b/app/web/static/index.html
+@@ -29,6 +29,6 @@
+ <div class="toasts" id="toasts" role="status" aria-live="polite"></div>
+ <input type="file" id="file" accept="image/*" capture="environment" hidden>
+ <footer class="foot"><div class="wrap" id="foot"></div></footer>
+-<script src="/static/app.js?v=22"></script>
++<script src="/static/app.js?v=23"></script>
+ </body>
+ </html>
+diff --git a/tests/test_line_sync_smoke.py b/tests/test_line_sync_smoke.py
+new file mode 100644
+index 0000000..ccf1d12
+--- /dev/null
++++ b/tests/test_line_sync_smoke.py
+@@ -0,0 +1,51 @@
++from fastapi.testclient import TestClient
++
++from app import config, db
++from app.main import app
++from app.web import line_sync
++
++UID = "U" + "a" * 32
++BOT = {"Authorization": "Bearer test-secret", "X-Line-User": UID}
++MEAL = {
++    "name_en": "Pad Thai", "name_th": "", "kcal": 400, "grams": 200,
++    "protein_g": 12, "carbs_g": 50, "fat_g": 10, "source": "thai_table",
++}
++
++
++def test_cross_platform(tmp_path, monkeypatch):
++    monkeypatch.setattr(config.settings, "db_path", str(tmp_path / "sync.db"))
++    monkeypatch.setenv("GINDEE_SYNC_SECRET", "test-secret")
++    db.init_db()
++    web = TestClient(app, base_url="https://gindee.test")
++    guest = TestClient(app, base_url="https://gindee.test", headers={"X-Gindee-User": UID})
++    bot = TestClient(app, base_url="https://gindee.test", headers=BOT)
++
++    assert guest.post("/api/line/link", headers={"X-Line-User": UID}).status_code == 401
++    token = bot.post("/api/line/link").json()["token"]
++    assert web.post("/api/line/session", json={"token": token}).status_code == 200
++    assert web.post("/api/line/session", json={"token": token}).status_code == 410
++    assert web.get("/api/me").json()["line_connected"]
++    assert not guest.get("/api/me").json()["line_connected"]
++
++    async def estimate(*args):
++        return {"is_food": True, "items": [MEAL]}
++
++    monkeypatch.setattr(line_sync.api, "estimate_text", estimate)
++    monkeypatch.setattr(line_sync.api, "scan_food", estimate)
++    assert bot.post("/api/line/estimate", json={"message_id": "123", "text": "Pad Thai"}).json()["items"]
++    assert bot.post("/api/line/scan/124", files={"file": ("test.jpg", b"image", "image/jpeg")}).json()["items"]
++    assert web.get("/api/day").json()["entries"] == []
++    assert bot.post("/api/line/confirm/123", headers={"X-Line-User": "U" + "b" * 32}).status_code == 404
++    assert bot.post("/api/line/confirm/123").json()["ids"]
++    assert bot.post("/api/line/confirm/123").json()["already_logged"]
++    assert bot.post("/api/line/confirm/124").json()["ids"]
++    assert len(web.get("/api/day").json()["entries"]) == 2
++    assert guest.get("/api/day").json()["entries"] == []
++
++    assert web.post("/api/log", json={"slot": "lunch", "items": [{**MEAL, "name_en": "Website lunch"}]}).status_code == 200
++    summary = bot.get("/api/line/day").json()
++    assert len(summary["entries"]) == 3
++    assert any(row["name_en"] == "Website lunch" for row in summary["entries"])
++    assert summary["totals"]["kcal"] == 1200
++    assert web.delete("/api/line/session").status_code == 200
++    assert web.get("/api/day").status_code == 401

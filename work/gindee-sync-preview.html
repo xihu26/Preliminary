@@ -1,0 +1,154 @@
+<div id="gindee-sync-preview" class="viz-dotted-background">
+  <div class="sync-layout">
+    <section class="line-window" aria-label="LINE chat">
+      <header><i data-lucide="message-circle" aria-hidden="true"></i> LINE · GinDee</header>
+      <div class="window-content">
+        <div class="chat" role="log" aria-label="Chat messages">
+          <p class="incoming" data-view="chat">Send a meal photo or description to get an estimate and log it in GinDee.</p>
+        </div>
+        <div class="actions">
+          <button type="button" data-action="connect">Connect GinDee</button>
+          <button type="button" data-action="open" hidden>Open GinDee</button>
+          <button type="button" data-action="send">Send “Shrimp pad Thai”</button>
+          <button type="button" data-action="log" hidden>Log meal</button>
+          <button type="button" data-action="summary">Today’s summary</button>
+        </div>
+      </div>
+    </section>
+    <section class="web-window" aria-label="GinDee website">
+      <header><i data-lucide="notebook-pen" aria-hidden="true"></i> GinDee · Diary</header>
+      <div class="window-content">
+        <div class="session-caption" data-view="session">Guest session</div>
+        <div class="actions">
+          <button type="button" data-action="signin" hidden>Continue with LINE</button>
+        </div>
+        <div aria-live="polite">
+          <h3>Today</h3>
+          <p class="diary-total" data-view="total">0 kcal</p>
+          <ul class="meals" data-view="meals"><li>No meals logged yet.</li></ul>
+        </div>
+        <div class="actions"><button type="button" data-action="webmeal" disabled>Log “Chicken basil rice”</button></div>
+      </div>
+    </section>
+  </div>
+</div>
+<style>
+#gindee-sync-preview {
+  color-scheme: light dark;
+  --sync-ink: light-dark(#202621,#edf2ed);
+  --sync-quiet: light-dark(#515d56,#b5c4b8);
+  --sync-line: light-dark(#eaf2fa,#222e3b);
+  --sync-web: light-dark(#f8fbf6,#1c281f);
+  --sync-surface: light-dark(#fff,#2b3830);
+  --sync-border: light-dark(#d0dbd2,#435549);
+  --sync-action: light-dark(#145939,#abe5bf);
+  --sync-action-fill: light-dark(#d8eedc,#294737);
+  color: var(--sync-ink);
+  font-family: system-ui, sans-serif;
+  padding: 12px;
+}
+#gindee-sync-preview .sync-layout {display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}
+#gindee-sync-preview section {border:1px solid var(--sync-border);border-radius:16px;overflow:hidden}
+#gindee-sync-preview .line-window {background:var(--sync-line)}
+#gindee-sync-preview .web-window {background:var(--sync-web)}
+#gindee-sync-preview header {display:flex;align-items:center;gap:8px;padding:12px 16px;background:var(--sync-surface);border-bottom:1px solid var(--sync-border);font-weight:500}
+#gindee-sync-preview .window-content {padding:14px;display:grid;gap:12px;align-content:start}
+#gindee-sync-preview .chat {display:grid;gap:8px}
+#gindee-sync-preview .incoming {margin:0;white-space:pre-line;background:var(--sync-surface);border-radius:4px 13px 13px 13px;padding:10px 12px}
+#gindee-sync-preview .actions {display:flex;flex-wrap:wrap;gap:7px}
+#gindee-sync-preview .actions:has(> [hidden]:only-child) {display:none}
+#gindee-sync-preview button {font:inherit;color:var(--sync-action);background:var(--sync-surface);border:1px solid var(--sync-border);border-radius:10px;padding:8px 11px;text-align:left;min-height:40px}
+#gindee-sync-preview button:is([data-action="log"],[data-action="signin"],[data-action="webmeal"]:enabled) {background:var(--sync-action-fill)}
+#gindee-sync-preview button:disabled {opacity:.55}
+#gindee-sync-preview [hidden] {display:none !important}
+#gindee-sync-preview .session-caption, #gindee-sync-preview .meals small {color:var(--sync-quiet)}
+#gindee-sync-preview .diary-total {margin:4px 0 8px;font-variant-numeric:tabular-nums}
+#gindee-sync-preview .meals {list-style:none;padding:0;margin:0}
+#gindee-sync-preview .meals li {display:grid;gap:2px;border-bottom:1px solid var(--sync-border);padding:8px 0}
+@media(max-width:570px){#gindee-sync-preview .sync-layout {grid-template-columns:1fr}}
+@media(pointer:coarse){#gindee-sync-preview button {min-height:44px}}
+</style>
+<script>
+(() => {
+  const root = document.getElementById('gindee-sync-preview');
+  const action = (name) => root.querySelector('[data-action="' + name + '"]');
+  const view = (name) => root.querySelector('[data-view="' + name + '"]');
+  const meals = [
+    { name: 'Shrimp pad Thai', kcal: 610, protein: 25, carbs: 76, fat: 23, source: 'LINE' },
+    { name: 'Chicken basil rice', kcal: 520, protein: 30, carbs: 62, fat: 17, source: 'Website' }
+  ];
+  const defaults = { link: false, opened: false, signedIn: false, estimated: false, lineMeal: false, webMeal: false, chat: '' };
+  let state = { ...defaults, ...window.openai?.widgetState?.privateContent };
+  const saved = () => meals.filter((_, i) => i === 0 ? state.lineMeal : state.webMeal);
+  const totals = (entries) => Object.fromEntries(['kcal', 'protein', 'carbs', 'fat'].map(key =>
+    [key, entries.reduce((sum, meal) => sum + meal[key], 0)]));
+  const nutrition = (meal) => `${meal.kcal} kcal · ${meal.protein} g protein · ${meal.carbs} g carbs · ${meal.fat} g fat`;
+  function render() {
+    action('open').hidden = !state.link || state.opened;
+    action('signin').hidden = !state.opened || state.signedIn;
+    action('log').hidden = !state.estimated || state.lineMeal;
+    action('send').disabled = state.estimated;
+    action('webmeal').disabled = !state.signedIn || state.webMeal;
+    view('session').textContent = state.signedIn ? 'Signed in with LINE' : 'Guest session';
+    const entries = state.signedIn ? saved() : [];
+    view('total').textContent = entries.length ? nutrition(totals(entries)) : '0 kcal';
+    const list = view('meals');
+    const rows = entries.map(meal => {
+      const li = document.createElement('li');
+      const detail = document.createElement('small');
+      li.textContent = meal.name;
+      detail.textContent = `${meal.kcal} kcal · Logged via ${meal.source}`;
+      li.append(detail);
+      return li;
+    });
+    if (!rows.length) {
+      const li = document.createElement('li');
+      li.textContent = 'No meals logged yet.';
+      rows.push(li);
+    }
+    list.replaceChildren(...rows);
+    view('chat').textContent = state.chat || 'Send a meal photo or description to get an estimate and log it in GinDee.';
+  }
+  const commands = {
+    connect() {
+      state.link = true;
+      state.opened = false;
+      state.chat = 'Open your GinDee diary with this one-time link. It expires in five minutes.';
+    },
+    open() { state.opened = true; },
+    signin() { state.signedIn = true; },
+    send() {
+      state.estimated = true;
+      state.chat = `GinDee’s estimate\n${meals[0].name} · ${nutrition(meals[0])}`;
+    },
+    log() {
+      state.lineMeal = true;
+      state.chat = '✓ Added to your GinDee diary.';
+    },
+    webmeal() { state.webMeal = true; },
+    summary() {
+      const entries = saved();
+      state.chat = entries.length
+        ? ['Today’s diary', nutrition(totals(entries)), ...entries.map(meal => `${meal.name} · ${meal.kcal} kcal`)].join(String.fromCharCode(10))
+        : 'Your GinDee diary has no meals for today.';
+    }
+  };
+  root.addEventListener('click', event => {
+    const button = event.target.closest('button[data-action]');
+    if (!button || button.disabled) return;
+    commands[button.dataset.action]();
+    render();
+    window.openai?.setWidgetState?.({ privateContent: state })?.catch(() => {});
+    const next = { connect: 'open', open: 'signin', signin: 'send', send: 'log', log: 'summary', webmeal: 'summary' }[button.dataset.action];
+    if (next && !action(next).hidden && !action(next).disabled) action(next).focus();
+  });
+  window.addEventListener('openai:set_globals', event => {
+    const snapshot = event.detail?.globals?.widgetState;
+    if (snapshot) {
+      state = { ...defaults, ...snapshot.privateContent };
+      render();
+    }
+  });
+  render();
+})();
+</script>
